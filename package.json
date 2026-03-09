@@ -1,0 +1,16 @@
+{
+  "name": "acidnet_front",
+  "version": "1.0.0",
+  "description": "AcidNet frontend shell and scene contract tests",
+  "scripts": {
+    "test": "playwright test",
+    "test:scene": "playwright test",
+    "test:scene:headed": "playwright test --headed",
+    "test:scene:debug": "PWDEBUG=console playwright test --headed",
+    "test:scene:ui": "playwright test --ui"
+  },
+  "type": "module",
+  "devDependencies": {
+    "@playwright/test": "^1.58.2"
+  }
+}
