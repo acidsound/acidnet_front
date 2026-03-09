@@ -1863,8 +1863,13 @@
       mockMode: false,
       commandBusy: false,
       focusPanelOpen: false,
+      panelMode: "none",
+      radialMenuOpen: false,
+      radialSelection: 0,
+      radialDesktopVector: { x: 0, y: -1 },
       hoverWorldTarget: null,
       overlayHover: null,
+      npcSpeechById: {},
       reticleMode: "idle",
       lastFrameAt: 0,
       pointer: {
@@ -1885,14 +1890,27 @@
         enabled: false,
         moveTouchId: null,
         lookTouchId: null,
+        overlayTouchId: null,
+        pendingHotspot: null,
         moveVector: { x: 0, y: 0 },
         lastLook: { x: 0, y: 0 },
       },
       xrSupported: false,
       xrPanelsOpen: false,
+      xrReferenceSpaceType: "local-floor",
     };
     const testFlags = globalThis.__ACIDNET_TEST_FLAGS__ || {};
+    const urlParams = new URLSearchParams(location.search);
+    const configuredApiBase = (urlParams.get("apiBase") || "").trim().replace(/\/+$/, "");
+    const defaultApiBase = !configuredApiBase && location.port === "4173"
+      ? `${location.protocol}//${location.hostname || "127.0.0.1"}:8765`
+      : "";
+    const apiBase = configuredApiBase || defaultApiBase;
     let spectorLoaderPromise = null;
+
+    function apiUrl(path) {
+      return `${apiBase}${path}`;
+    }
 
     const demoState = {
       state_version: 3,
@@ -2145,6 +2163,84 @@
         .replace(/\b\w/g, (part) => part.toUpperCase());
     }
 
+    function pruneNpcSpeech(now = performance.now()) {
+      let changed = false;
+      for (const [npcId, entry] of Object.entries(app.npcSpeechById || {})) {
+        if (!entry || Number(entry.expiresAt || 0) <= now) {
+          delete app.npcSpeechById[npcId];
+          changed = true;
+        }
+      }
+      return changed;
+    }
+
+    function ingestNpcSpeechEvents(state = app.state) {
+      if (!state) {
+        return false;
+      }
+      pruneNpcSpeech();
+      const people = state.scene?.people || [];
+      const nameToNpcId = new Map(people.map((person) => [String(person.name || "").trim().toLowerCase(), person.npc_id]));
+      let changed = false;
+      for (const event of state.recent_events || []) {
+        if (event?.kind !== "npc") {
+          continue;
+        }
+        let npcId = event.npc_id || "";
+        let text = String(event.text || "").trim();
+        if (!npcId) {
+          const match = text.match(/^([^:]{1,80}):\s*(.+)$/);
+          if (match) {
+            npcId = nameToNpcId.get(match[1].trim().toLowerCase()) || "";
+            text = match[2].trim();
+          }
+        }
+        if (!npcId || !text) {
+          continue;
+        }
+        const seq = Number(event.seq || 0);
+        const current = app.npcSpeechById[npcId];
+        if (current && Number(current.seq || 0) >= seq) {
+          continue;
+        }
+        app.npcSpeechById[npcId] = {
+          seq,
+          text,
+          expiresAt: performance.now() + 4000,
+        };
+        changed = true;
+      }
+      return changed;
+    }
+
+    function lastPlayerSpeech(state = app.state) {
+      for (const event of [...(state?.recent_events || [])].reverse()) {
+        if (event?.kind !== "input") {
+          continue;
+        }
+        const raw = String(event.text || "").replace(/^>\s*/, "").trim();
+        if (!raw) {
+          continue;
+        }
+        const sayMatch = raw.match(/^say(?:\s+\S+)?\s+(.+)$/i);
+        if (sayMatch?.[1]) {
+          return sayMatch[1].trim();
+        }
+        if (/^talk(?:\s+\S+)?$/i.test(raw)) {
+          return "What is going on around here?";
+        }
+        const askRumorMatch = raw.match(/^ask(?:\s+\S+)?\s+rumor$/i);
+        if (askRumorMatch) {
+          return "Have you heard any useful rumors?";
+        }
+        const askTopicMatch = raw.match(/^ask(?:\s+\S+)?\s+(.+)$/i);
+        if (askTopicMatch?.[1]) {
+          return `What do you know about ${askTopicMatch[1].trim()}?`;
+        }
+      }
+      return "";
+    }
+
     function isTypingTarget(target) {
       return target instanceof HTMLElement && (
         target.tagName === "INPUT" ||
@@ -2294,7 +2390,9 @@
           threeUiActive: document.body.classList.contains("three-ui-active"),
           focusPanelOpen: !!app.focusPanelOpen,
           ledgerOpen: dom.ledgerDrawer?.classList.contains("open") || false,
-          xrPanelsOpen: !!app.xrPanelsOpen,
+          xrPanelsOpen: app.panelMode !== "none" || !!app.radialMenuOpen,
+          panelMode: app.panelMode,
+          radialMenuOpen: !!app.radialMenuOpen,
           touchEnabled: !!app.touchControls.enabled,
           reticleNote: dom.reticleNote?.textContent || "",
           worldHint: dom.worldHint?.textContent || "",
@@ -2497,7 +2595,7 @@
       if (app.desktopControls.pointerLocked) {
         dom.worldHint.textContent = travel
           ? "Move with WASD along the road. `E` opens road actions. There is no local focus until arrival."
-          : "Move with WASD. Click an NPC while looking at them to focus. `E` opens interaction. `Tab` opens the ledger.";
+          : "Move with WASD. Click an NPC while looking at them to focus. E or Tab opens the action menu.";
         return;
       }
       dom.worldHint.textContent = travel
@@ -2510,22 +2608,146 @@
     }
 
     function toggleLedger(force = null) {
-      const next = force == null ? !dom.ledgerDrawer.classList.contains("open") : !!force;
-      dom.ledgerDrawer.classList.toggle("open", next);
-      dom.ledgerToggle.textContent = next ? "Close Ledger" : "Open Ledger";
-      if (next) {
-        document.exitPointerLock?.();
-      }
+      const next = force == null ? app.panelMode !== "settlement" : !!force;
+      setPanelMode(next ? "settlement" : "none");
+    }
+
+    function setPanelMode(mode = "none") {
+      const nextMode = mode === "attention" || mode === "settlement" ? mode : "none";
+      app.panelMode = nextMode;
+      app.focusPanelOpen = nextMode === "attention";
+      const ledgerOpen = nextMode === "settlement";
+      dom.ledgerDrawer.classList.toggle("open", ledgerOpen);
+      dom.ledgerToggle.textContent = ledgerOpen ? "Close Ledger" : "Open Ledger";
+      dom.focusStage.closest(".hud-focus")?.classList.toggle("active", app.focusPanelOpen);
       markUIPanelsDirty();
     }
 
     function updateFocusVisibility() {
-      const shouldShow = !!app.focusPanelOpen;
+      setPanelMode(app.focusPanelOpen ? "attention" : "none");
+      const shouldShow = app.panelMode === "attention";
       dom.focusStage.closest(".hud-focus")?.classList.toggle("active", shouldShow);
-      if (shouldShow) {
-        document.exitPointerLock?.();
-      }
       markUIPanelsDirty();
+    }
+
+    function toggleRadialMenu(force = null) {
+      const next = force == null ? !app.radialMenuOpen : !!force;
+      app.radialMenuOpen = next;
+      app.radialSelection = 0;
+      app.radialDesktopVector.x = 0;
+      app.radialDesktopVector.y = -1;
+      markUIPanelsDirty();
+    }
+
+    function getRadialEntries(state = app.state) {
+      if (!state) {
+        return [];
+      }
+      const entries = [
+        {
+          id: "radial-settlement",
+          label: isTravelingState(state) ? "Road" : "Settlement",
+          subtitle: "Area shell",
+          enabled: true,
+          onSelect: () => setPanelMode("settlement"),
+        },
+        {
+          id: "radial-attention",
+          label: "Attention",
+          subtitle: currentTargetPerson()?.name || "Focus shell",
+          enabled: true,
+          onSelect: () => setPanelMode("attention"),
+        },
+        {
+          id: "radial-hide",
+          label: "Clear",
+          subtitle: "Hide panels",
+          enabled: true,
+          onSelect: () => setPanelMode("none"),
+        },
+      ];
+
+      if (app.panelMode === "attention" && !isTravelingState(state)) {
+        for (const action of (state.actions.target || []).slice(0, 2)) {
+          entries.push({
+            id: `radial-target-${action.command}`,
+            label: action.label,
+            subtitle: actionBlockedReason(action, state) || action.command,
+            enabled: actionEnabled(action, state),
+            onSelect: () => sendCommand(action.command),
+          });
+        }
+        const mode = currentTradeMode();
+        for (const option of tradeOptionsForTarget(mode).slice(0, 2)) {
+          entries.push({
+            id: `radial-trade-${mode}-${option.item}`,
+            label: `${titleCase(mode)} ${option.item}`,
+            subtitle: option.price == null ? "1 unit" : `${option.price}g`,
+            enabled: !!currentTargetPerson(),
+            onSelect: () => runTrade(option.item, 1),
+          });
+        }
+      } else {
+        const source = isTravelingState(state)
+          ? (state.actions.common || []).filter((action) => ["look", "meal", "next 1"].includes(action.command))
+          : (state.actions.common || []).slice(0, 4);
+        for (const action of source.slice(0, 4)) {
+          entries.push({
+            id: `radial-world-${action.command}`,
+            label: action.label,
+            subtitle: isTravelingState(state) ? roadActionSubtitle(action) : (actionBlockedReason(action, state) || action.command),
+            enabled: actionEnabled(action, state),
+            onSelect: () => sendCommand(action.command),
+          });
+        }
+      }
+
+      return entries.slice(0, 8);
+    }
+
+    function setRadialSelection(index) {
+      const entries = getRadialEntries();
+      if (!entries.length) {
+        app.radialSelection = 0;
+        return;
+      }
+      app.radialSelection = ((index % entries.length) + entries.length) % entries.length;
+      markUIPanelsDirty();
+    }
+
+    function stepRadialSelection(delta) {
+      setRadialSelection(app.radialSelection + delta);
+    }
+
+    function updateDesktopRadialSelectionFromVector() {
+      const entries = getRadialEntries();
+      if (!entries.length) {
+        app.radialSelection = 0;
+        return;
+      }
+      const { x, y } = app.radialDesktopVector;
+      const magnitude = Math.hypot(x, y);
+      if (magnitude < 0.22) {
+        setRadialSelection(0);
+        return;
+      }
+      const step = (Math.PI * 2) / entries.length;
+      const angle = Math.atan2(y, x);
+      const normalized = (angle + Math.PI * 2 + Math.PI / 2) % (Math.PI * 2);
+      const index = Math.floor((normalized + step * 0.5) / step) % entries.length;
+      setRadialSelection(index);
+    }
+
+    function activateRadialSelection() {
+      const entries = getRadialEntries();
+      const entry = entries[app.radialSelection] || null;
+      if (!entry || entry.enabled === false) {
+        return false;
+      }
+      entry.onSelect?.();
+      app.radialMenuOpen = false;
+      markUIPanelsDirty();
+      return true;
     }
 
     function setReticleState(mode = "idle") {
@@ -2546,10 +2768,10 @@
 
     function updateReticleNote(text = "") {
       const message = text || (isTravelingState()
-        ? "The road has no one to focus. Press E for road actions and spend turns until the exit clock reaches zero."
+        ? "The road has no one to focus. Press E or Tab for road actions and spend turns until the exit clock reaches zero."
         : currentTargetPerson()
-          ? "Look at the focused person, click to engage, or press E for close actions."
-          : "Look at someone in the square, then click to focus. Press E for close actions.");
+          ? "Look at the focused person, click to engage, or press E or Tab for the action menu."
+          : "Look at someone in the square, then click to focus. Press E or Tab for the action menu.");
       dom.reticleNote.textContent = message;
       dom.reticleNote.classList.toggle("active", !!text || !!app.hoverWorldTarget || !!currentTargetPerson() || isTravelingState());
       markUIPanelsDirty();
@@ -2659,7 +2881,7 @@
         render(app.state);
         return;
       }
-      const response = await fetch("/api/state", { cache: "no-store" });
+      const response = await fetch(apiUrl("/api/state"), { cache: "no-store" });
       if (!response.ok) {
         throw new Error(`GET /api/state failed with ${response.status}`);
       }
@@ -2689,7 +2911,7 @@
       }
       setBusy(true);
       try {
-        const response = await fetch("/api/command", {
+        const response = await fetch(apiUrl("/api/command"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ command }),
@@ -2712,7 +2934,7 @@
       if (app.mockMode) {
         return;
       }
-      const response = await fetch(`/api/events?after_seq=${app.latestEventSeq}&timeout_s=20&limit=96`, {
+      const response = await fetch(apiUrl(`/api/events?after_seq=${app.latestEventSeq}&timeout_s=20&limit=96`), {
         cache: "no-store",
       });
       if (!response.ok) {
@@ -2745,7 +2967,7 @@
         dom.promptStatus.textContent = "Demo mode: prompt writes are disabled.";
         return;
       }
-      const response = await fetch("/api/dialogue-prompt", { cache: "no-store" });
+      const response = await fetch(apiUrl("/api/dialogue-prompt"), { cache: "no-store" });
       if (!response.ok) {
         throw new Error(`GET /api/dialogue-prompt failed with ${response.status}`);
       }
@@ -2760,7 +2982,7 @@
         dom.promptStatus.textContent = "Demo mode: prompt writes are disabled.";
         return;
       }
-      const response = await fetch("/api/dialogue-prompt", {
+      const response = await fetch(apiUrl("/api/dialogue-prompt"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ prompt: dom.promptEditor.value }),
@@ -2780,7 +3002,7 @@
         dom.promptStatus.textContent = "Demo mode: prompt writes are disabled.";
         return;
       }
-      const response = await fetch("/api/dialogue-prompt", {
+      const response = await fetch(apiUrl("/api/dialogue-prompt"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ reset_default: true }),
@@ -3494,6 +3716,7 @@
       if (!state) {
         return;
       }
+      ingestNpcSpeechEvents(state);
       if (!state.target && !state.player.travel_state?.is_traveling) {
         app.focusPanelOpen = false;
       }
@@ -3545,7 +3768,7 @@
           await fetchState();
           return;
         }
-        setDialogueStatus("Could not reach /api/state. Open with ?demo=1 for a local shell preview.", "No live server");
+        setDialogueStatus(`Could not reach ${apiUrl("/api/state")}. Open with ?demo=1 for a local shell preview.`, "No live server");
       }
     }
 
@@ -3669,17 +3892,38 @@
       dom.reloadPrompt.addEventListener("click", loadPrompt);
 
       window.addEventListener("keydown", (event) => {
+        if (app.radialMenuOpen && !isTypingTarget(event.target)) {
+          if (event.code === "ArrowLeft" || event.code === "KeyA") {
+            event.preventDefault();
+            stepRadialSelection(-1);
+            return;
+          }
+          if (event.code === "ArrowRight" || event.code === "KeyD") {
+            event.preventDefault();
+            stepRadialSelection(1);
+            return;
+          }
+          if (event.code === "Enter" || event.code === "Space") {
+            event.preventDefault();
+            activateRadialSelection();
+            return;
+          }
+          const digit = Number(event.key);
+          if (Number.isInteger(digit) && digit >= 1 && digit <= 8) {
+            event.preventDefault();
+            setRadialSelection(digit - 1);
+            activateRadialSelection();
+            return;
+          }
+        }
         if (event.code === "Tab") {
           event.preventDefault();
-          toggleLedger();
+          toggleRadialMenu();
           return;
         }
         if (event.code === "KeyE" && !isTypingTarget(event.target)) {
           event.preventDefault();
-          if (app.focusPanelOpen || app.state?.player?.travel_state?.is_traveling || app.state?.target) {
-            app.focusPanelOpen = !app.focusPanelOpen;
-            updateFocusVisibility();
-          }
+          toggleRadialMenu();
         }
       });
     }
@@ -3717,27 +3961,92 @@
     }
 
     function createTextBillboard(THREE, text, color = "#f1e3c9", width = 300, height = 84) {
+      const uiScale = 3;
+      const logicalWidth = width;
+      const logicalHeight = height;
       const canvas = document.createElement("canvas");
-      canvas.width = width;
-      canvas.height = height;
+      canvas.width = logicalWidth * uiScale;
+      canvas.height = logicalHeight * uiScale;
       const ctx = canvas.getContext("2d");
-      ctx.clearRect(0, 0, width, height);
+      ctx.setTransform(uiScale, 0, 0, uiScale, 0, 0);
+      ctx.clearRect(0, 0, logicalWidth, logicalHeight);
       ctx.fillStyle = "rgba(5, 10, 10, 0.58)";
-      roundRect(ctx, 0, 0, width, height, 28);
+      roundRect(ctx, 0, 0, logicalWidth, logicalHeight, 28);
       ctx.fill();
       ctx.strokeStyle = "rgba(237,219,190,0.16)";
       ctx.stroke();
       ctx.fillStyle = color;
-      ctx.font = "700 30px Avenir Next Condensed, Gill Sans, sans-serif";
+      ctx.font = "700 28px Avenir Next Condensed, Gill Sans, sans-serif";
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      ctx.fillText(text, width / 2, height / 2);
+      ctx.fillText(text, logicalWidth / 2, logicalHeight / 2 + 1);
       const texture = new THREE.CanvasTexture(canvas);
       texture.colorSpace = THREE.SRGBColorSpace;
-      const material = new THREE.MeshBasicMaterial({ map: texture, transparent: true });
-      const mesh = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 0.34), material);
-      mesh.userData.texture = texture;
-      return mesh;
+      texture.generateMipmaps = false;
+      texture.minFilter = THREE.LinearFilter;
+      texture.magFilter = THREE.LinearFilter;
+      texture.needsUpdate = true;
+      const material = new THREE.SpriteMaterial({
+        map: texture,
+        transparent: true,
+      });
+      const sprite = new THREE.Sprite(material);
+      sprite.scale.set(1.2, 0.34, 1);
+      sprite.userData.texture = texture;
+      sprite.frustumCulled = false;
+      return sprite;
+    }
+
+    function createSpeechBillboard(THREE, text, width = 420, height = 138) {
+      const uiScale = 3;
+      const logicalWidth = width;
+      const logicalHeight = height;
+      const canvas = document.createElement("canvas");
+      canvas.width = logicalWidth * uiScale;
+      canvas.height = logicalHeight * uiScale;
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(uiScale, 0, 0, uiScale, 0, 0);
+      ctx.clearRect(0, 0, logicalWidth, logicalHeight);
+      ctx.fillStyle = "rgba(10, 15, 16, 0.84)";
+      roundRect(ctx, 0, 0, logicalWidth, logicalHeight - 18, 30);
+      ctx.fill();
+      ctx.strokeStyle = "rgba(241,227,201,0.24)";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(logicalWidth * 0.5 - 16, logicalHeight - 18);
+      ctx.lineTo(logicalWidth * 0.5 + 2, logicalHeight - 2);
+      ctx.lineTo(logicalWidth * 0.5 + 22, logicalHeight - 18);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = "#f5ead6";
+      ctx.font = "600 24px Avenir Next Condensed, Gill Sans, sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      wrapCanvasText(ctx, text, 28, 42, logicalWidth - 56, 28, 3, true);
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.colorSpace = THREE.SRGBColorSpace;
+      texture.generateMipmaps = false;
+      texture.minFilter = THREE.LinearFilter;
+      texture.magFilter = THREE.LinearFilter;
+      texture.needsUpdate = true;
+      const material = new THREE.SpriteMaterial({
+        map: texture,
+        transparent: true,
+        depthTest: false,
+        depthWrite: false,
+      });
+      const sprite = new THREE.Sprite(material);
+      sprite.scale.set(1.34, 0.44, 1);
+      sprite.renderOrder = 1000;
+      sprite.userData.texture = texture;
+      sprite.frustumCulled = false;
+      return sprite;
+    }
+
+    function updateBillboardsFacingCamera(three) {
+      return;
     }
 
     function buildVillageBackdrop(THREE, scene) {
@@ -4048,6 +4357,12 @@
         if (!app.desktopControls.pointerLocked) {
           return;
         }
+        if (app.radialMenuOpen) {
+          app.radialDesktopVector.x = clamp(app.radialDesktopVector.x + event.movementX * 0.018, -1, 1);
+          app.radialDesktopVector.y = clamp(app.radialDesktopVector.y + event.movementY * 0.018, -1, 1);
+          updateDesktopRadialSelectionFromVector();
+          return;
+        }
         app.desktopControls.yaw -= event.movementX * 0.0024;
         app.desktopControls.pitch = clamp(app.desktopControls.pitch - event.movementY * 0.0019, -0.95, 0.85);
       });
@@ -4065,6 +4380,10 @@
     }
 
     function onCanvasClick(event) {
+      if (app.radialMenuOpen && app.desktopControls.pointerLocked) {
+        activateRadialSelection();
+        return;
+      }
       if (!app.desktopControls.pointerLocked) {
         if (activateOverlayHover(event?.clientX ?? null, event?.clientY ?? null)) {
           return;
@@ -4075,7 +4394,7 @@
           $("world-canvas").requestPointerLock?.();
           return;
         }
-        if (app.focusPanelOpen || dom.ledgerDrawer.classList.contains("open")) {
+        if (app.panelMode !== "none") {
           return;
         }
         if (app.touchControls.enabled) {
@@ -4089,7 +4408,12 @@
     function onCanvasTouchStart(event) {
       app.touchControls.enabled = true;
       for (const touch of event.changedTouches) {
-        if (updatePointerFromClient(touch.clientX, touch.clientY) && activateOverlayHover(touch.clientX, touch.clientY)) {
+        if (updatePointerFromClient(touch.clientX, touch.clientY) && app.three) {
+          updateOverlayHover(app.three);
+        }
+        if (app.overlayHover?.hotspot) {
+          app.touchControls.overlayTouchId = touch.identifier;
+          app.touchControls.pendingHotspot = app.overlayHover.hotspot;
           event.preventDefault();
           continue;
         }
@@ -4135,6 +4459,22 @@
 
     function onCanvasTouchEnd(event) {
       for (const touch of event.changedTouches) {
+        if (touch.identifier === app.touchControls.overlayTouchId) {
+          if (updatePointerFromClient(touch.clientX, touch.clientY) && app.three) {
+            updateOverlayHover(app.three);
+          }
+          const hotspot = app.overlayHover?.hotspot;
+          if (
+            hotspot
+            && app.touchControls.pendingHotspot
+            && hotspot.id === app.touchControls.pendingHotspot.id
+            && hotspot.enabled !== false
+          ) {
+            hotspot.onSelect?.();
+          }
+          app.touchControls.overlayTouchId = null;
+          app.touchControls.pendingHotspot = null;
+        }
         if (touch.identifier === app.touchControls.moveTouchId) {
           app.touchControls.moveTouchId = null;
           app.touchControls.moveOrigin = null;
@@ -4215,7 +4555,7 @@
         app.hoverWorldTarget = null;
         const target = currentTargetPerson();
         setReticleState(target ? "npc" : (isTravelingState() ? "route" : "idle"));
-        updateReticleNote(target ? `${target.name} is focused. Press E to open interaction.` : "");
+        updateReticleNote(target ? `${target.name} is focused. Press E or Tab for the action menu.` : "");
         return;
       }
       let action = hits[0].object.userData.action || null;
@@ -4264,6 +4604,7 @@
       let moveForward = 0;
       let turnX = 0;
       let togglePanels = false;
+      let radialAngle = null;
       const up = new THREE.Vector3(0, 1, 0);
       const session = renderer.xr.getSession();
       const sources = session?.inputSources || [];
@@ -4278,7 +4619,13 @@
           moveX += gamepadAxis(gamepad, 2);
           moveForward += gamepadAxis(gamepad, 3);
         } else if (handedness === "right") {
-          turnX += gamepadAxis(gamepad, 2);
+          const stickX = gamepadAxis(gamepad, 2);
+          const stickY = gamepadAxis(gamepad, 3);
+          if (app.radialMenuOpen && Math.hypot(stickX, stickY) > 0.35) {
+            radialAngle = Math.atan2(stickY, stickX);
+          } else {
+            turnX += stickX;
+          }
         }
 
         const panelButtonPressed = gamepadPressed(gamepad, 3) || gamepadPressed(gamepad, 4);
@@ -4289,12 +4636,20 @@
       }
 
       if (togglePanels) {
-        app.xrPanelsOpen = !app.xrPanelsOpen;
-        markXRPanelsDirty();
+        toggleRadialMenu();
+      }
+
+      if (radialAngle != null) {
+        const entries = getRadialEntries();
+        if (entries.length) {
+          const normalized = (radialAngle + Math.PI * 2 + Math.PI / 2) % (Math.PI * 2);
+          const wedge = Math.floor((normalized / (Math.PI * 2)) * entries.length) % entries.length;
+          setRadialSelection(wedge);
+        }
       }
 
       const deadZone = 0.15;
-      if (Math.abs(turnX) > deadZone) {
+      if (!app.radialMenuOpen && Math.abs(turnX) > deadZone) {
         cameraRig.rotateY(-turnX * 1.85 * delta);
       }
 
@@ -4398,6 +4753,13 @@
         const label = createTextBillboard(THREE, person.name, person.is_target ? "#f1d2a0" : "#d3d7cb");
         label.position.set(0, person.is_target ? 2.42 : 2.18, 0);
         npc.add(label);
+        const speech = app.npcSpeechById?.[person.npc_id];
+        if (speech?.text) {
+          const bubble = createSpeechBillboard(THREE, speech.text);
+          bubble.position.set(0, person.is_target ? 3.08 : 2.84, 0);
+          npc.add(bubble);
+          three.billboards.push(bubble);
+        }
 
         const hit = new THREE.Mesh(
           new THREE.CylinderGeometry(0.42, 0.42, 2.3, 8),
@@ -4569,7 +4931,7 @@
         renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.75));
         renderer.setSize(window.innerWidth, window.innerHeight);
         renderer.xr.enabled = true;
-        renderer.xr.setReferenceSpaceType("local-floor");
+        renderer.xr.setReferenceSpaceType(app.xrReferenceSpaceType);
 
         const scene = new THREE.Scene();
         scene.background = new THREE.Color(0x0a1110);
@@ -4724,11 +5086,16 @@
 
       if (!renderer.xr.isPresenting) {
         updateDesktopControls(delta);
-        for (const billboard of three.billboards || []) {
-          billboard.lookAt(camera.position);
+        updateBillboardsFacingCamera(three);
+        if (pruneNpcSpeech(performance.now())) {
+          syncThreeState();
         }
         updateWorldInteraction(three);
       } else {
+        updateBillboardsFacingCamera(three);
+        if (pruneNpcSpeech(performance.now())) {
+          syncThreeState();
+        }
         updateXRLocomotion(three, delta);
       }
 
@@ -4739,13 +5106,14 @@
 
     function createXRUi(THREE, renderer, scene, cameraRig) {
       const panelRoot = new THREE.Group();
-      panelRoot.position.set(0, 1.5, -1.35);
+      panelRoot.position.set(0, 1.42, -1.12);
       cameraRig.add(panelRoot);
 
       const panels = [
         createXRPanel(THREE, panelRoot, "world", -1.25, 0.15, 1.08, 0.72),
         createXRPanel(THREE, panelRoot, "feed", 0, 0.02, 1.18, 0.82),
         createXRPanel(THREE, panelRoot, "focus", 1.28, 0.12, 1.08, 0.72),
+        createXRPanel(THREE, panelRoot, "radial", 0, -0.14, 1.02, 1.02),
       ];
 
       const controllers = [];
@@ -4755,7 +5123,7 @@
       for (let index = 0; index < 2; index += 1) {
         const controller = renderer.xr.getController(index) || null;
         if (controller) {
-          scene.add(controller);
+          cameraRig.add(controller);
           const line = new THREE.Line(
             new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1)]),
             new THREE.LineBasicMaterial({ color: 0xf0d0a4, transparent: true, opacity: 0.9 })
@@ -4774,6 +5142,11 @@
             controller.userData.worldHoverTarget = null;
           });
           controller.addEventListener("selectstart", () => {
+            if (app.radialMenuOpen) {
+              if (activateRadialSelection()) {
+                return;
+              }
+            }
             const hover = controller.userData.hover;
             if (hover?.hotspot && hover.hotspot.enabled !== false) {
               hover.hotspot.onSelect();
@@ -4797,6 +5170,42 @@
       };
     }
 
+    function setXRPanelPose(panel, x, y, z = 0) {
+      if (!panel) {
+        return;
+      }
+      panel.mesh.position.set(x, y, z);
+      panel.frame.position.set(x, y, z - 0.01);
+    }
+
+    function layoutXRUi(three) {
+      const xrUi = three?.xrUi;
+      if (!xrUi) {
+        return;
+      }
+      const world = xrUi.panels.find((panel) => panel.id === "world");
+      const feed = xrUi.panels.find((panel) => panel.id === "feed");
+      const focus = xrUi.panels.find((panel) => panel.id === "focus");
+      const radial = xrUi.panels.find((panel) => panel.id === "radial");
+
+      xrUi.panelRoot.position.set(0, 1.42, -1.12);
+      setXRPanelPose(radial, 0, -0.08);
+
+      if (app.panelMode === "attention") {
+        setXRPanelPose(focus, 0, -0.26);
+      } else {
+        setXRPanelPose(focus, 1.28, 0.12);
+      }
+
+      if (app.panelMode === "settlement") {
+        setXRPanelPose(world, 0, -0.22);
+        setXRPanelPose(feed, 0, -0.92);
+      } else {
+        setXRPanelPose(world, -1.25, 0.15);
+        setXRPanelPose(feed, 0, 0.02);
+      }
+    }
+
     function createXRPanel(THREE, parent, id, x, y, width, height) {
       const uiScale = 2;
       const pixelsPerWorldUnit = 1200;
@@ -4813,7 +5222,8 @@
       texture.needsUpdate = true;
       const material = new THREE.MeshBasicMaterial({
         map: texture,
-        transparent: false,
+        transparent: true,
+        opacity: 1,
         depthTest: false,
         depthWrite: false,
       });
@@ -4826,6 +5236,8 @@
 
       const frameMaterial = new THREE.MeshBasicMaterial({
         color: 0x121818,
+        transparent: true,
+        opacity: 1,
         depthTest: false,
         depthWrite: false,
       });
@@ -4895,10 +5307,11 @@
 
       const panels = [
         createXRPanel(THREE, root, "status", -0.62, 0.4, 1.08, 0.4),
-        createXRPanel(THREE, root, "note", 0, -0.16, 1.08, 0.22),
-        createXRPanel(THREE, root, "world", -0.72, -0.02, 0.92, 0.84),
-        createXRPanel(THREE, root, "feed", 0, -0.02, 0.92, 0.84),
+        createXRPanel(THREE, root, "note", 0, -0.16, 0.972, 0.22),
+        createXRPanel(THREE, root, "world", -0.72, -0.02, 0.672, 0.5775),
+        createXRPanel(THREE, root, "feed", 0, -0.02, 0.672, 0.5775),
         createXRPanel(THREE, root, "focus", 0.72, -0.02, 0.92, 0.84),
+        createXRPanel(THREE, root, "radial", 0, -0.04, 0.82, 0.82),
         createXRPanel(THREE, root, "touch", 0, -0.5, 1.12, 0.24),
       ];
       const byId = Object.fromEntries(panels.map((panel) => [panel.id, panel]));
@@ -4962,22 +5375,41 @@
       if (compact) {
         positionPanelAnchored(three, overlay.byId.status, { anchorX: "left", anchorY: "top", marginX: 0.022, marginY: 0.022, z: -0.96, scale: 0.92 });
         positionPanelAnchored(three, overlay.byId.note, { anchorX: "center", anchorY: "bottom", marginY: 0.008, z: -0.84, scale: 1.02 });
-        positionPanelAnchored(three, overlay.byId.world, { anchorX: "left", anchorY: "top", marginX: 0.02, marginY: 0.16, z: -1.02, scale: 0.96 });
-        positionPanelAnchored(three, overlay.byId.feed, { anchorX: "center", anchorY: "top", marginY: 0.02, z: -1.02, scale: 0.96 });
+        positionPanelAnchored(three, overlay.byId.world, { anchorX: "left", anchorY: "bottom", marginX: 0.01, marginY: 0.008, z: -1.0, scale: 0.94 });
+        positionPanelAnchored(three, overlay.byId.feed, { anchorX: "right", anchorY: "bottom", marginX: 0.01, marginY: 0.008, z: -1.0, scale: 0.94 });
         positionPanelAnchored(three, overlay.byId.focus, { anchorX: "center", anchorY: "top", marginY: 0.02, z: -1.02, scale: 0.67 });
+        positionPanelAnchored(three, overlay.byId.radial, { anchorX: "center", anchorY: "center", offsetY: -0.04, z: -0.88, scale: 1 });
         positionPanelAnchored(three, overlay.byId.touch, { anchorX: "center", anchorY: "bottom", marginY: 0.12, z: -0.9, scale: 1 });
       } else {
         positionPanelAnchored(three, overlay.byId.status, { anchorX: "left", anchorY: "top", marginX: 0.024, marginY: 0.024, z: -1, scale: 0.9 });
         positionPanelAnchored(three, overlay.byId.note, { anchorX: "center", anchorY: "bottom", marginY: 0.008, z: -0.86, scale: 1.06 });
-        positionPanelAnchored(three, overlay.byId.world, { anchorX: "left", anchorY: "top", marginX: 0.03, marginY: 0.18, z: -1.1, scale: 0.98 });
-        positionPanelAnchored(three, overlay.byId.feed, { anchorX: "center", anchorY: "top", marginY: 0.04, z: -1.12, scale: 0.98 });
+        positionPanelAnchored(three, overlay.byId.world, { anchorX: "left", anchorY: "bottom", marginX: 0.012, marginY: 0.008, z: -1.06, scale: 1 });
+        positionPanelAnchored(three, overlay.byId.feed, { anchorX: "right", anchorY: "bottom", marginX: 0.012, marginY: 0.008, z: -1.06, scale: 1 });
         positionPanelAnchored(three, overlay.byId.focus, { anchorX: "right", anchorY: "top", marginX: 0.03, marginY: 0.03, z: -1.1, scale: 0.69 });
+        positionPanelAnchored(three, overlay.byId.radial, { anchorX: "center", anchorY: "center", offsetY: -0.05, z: -0.92, scale: 1 });
         positionPanelAnchored(three, overlay.byId.touch, { anchorX: "center", anchorY: "bottom", marginY: 0.12, z: -0.9, scale: 1 });
       }
     }
 
     function panelHotspotAtPoint(panel, point) {
       return panel.hotspots.find((candidate) => {
+        if (candidate.kind === "radial") {
+          const dx = point.x - candidate.cx;
+          const dy = point.y - candidate.cy;
+          const radius = Math.hypot(dx, dy);
+          if (radius < candidate.innerRadius || radius > candidate.outerRadius) {
+            return false;
+          }
+          let angle = Math.atan2(dy, dx);
+          while (angle < -Math.PI / 2) angle += Math.PI * 2;
+          let start = candidate.startAngle;
+          let end = candidate.endAngle;
+          while (start < -Math.PI / 2) {
+            start += Math.PI * 2;
+            end += Math.PI * 2;
+          }
+          return angle >= start && angle <= end;
+        }
         return point.x >= candidate.x && point.x <= candidate.x + candidate.w && point.y >= candidate.y && point.y <= candidate.y + candidate.h;
       }) || null;
     }
@@ -5051,6 +5483,12 @@
         return;
       }
       app.overlayHover = { panel, hotspot };
+      if (panel.id === "radial") {
+        const nextIndex = getRadialEntries().findIndex((entry) => entry.id === hotspot.id);
+        if (nextIndex >= 0) {
+          app.radialSelection = nextIndex;
+        }
+      }
       $("world-canvas").style.cursor = hotspot.enabled === false ? "not-allowed" : "pointer";
       for (const entry of overlay.panels) {
         const nextKey = entry === panel ? hotspot.id : "";
@@ -5077,6 +5515,14 @@
     }
 
     function setupXRSupport() {
+      if (!window.isSecureContext && !["localhost", "127.0.0.1"].includes(location.hostname)) {
+        app.xrSupported = false;
+        dom.xrSupport.textContent = "HTTPS required";
+        dom.xrToggle.textContent = "XR unavailable";
+        dom.xrToggle.disabled = true;
+        markUIPanelsDirty();
+        return;
+      }
       if (!app.three || !navigator.xr) {
         app.xrSupported = false;
         dom.xrSupport.textContent = "Desktop only";
@@ -5116,17 +5562,20 @@
       }
 
       const compact = app.touchControls.enabled || window.innerWidth < 920;
-      const ledgerOpen = dom.ledgerDrawer.classList.contains("open");
+      const settlementOpen = app.panelMode === "settlement";
+      const attentionOpen = app.panelMode === "attention";
       overlay.byId.status.mesh.visible = true;
       overlay.byId.status.frame.visible = true;
       overlay.byId.note.mesh.visible = true;
       overlay.byId.note.frame.visible = true;
-      overlay.byId.focus.mesh.visible = !!app.focusPanelOpen;
-      overlay.byId.focus.frame.visible = !!app.focusPanelOpen;
-      overlay.byId.world.mesh.visible = ledgerOpen;
-      overlay.byId.world.frame.visible = ledgerOpen;
-      overlay.byId.feed.mesh.visible = ledgerOpen && !compact;
-      overlay.byId.feed.frame.visible = ledgerOpen && !compact;
+      overlay.byId.focus.mesh.visible = attentionOpen;
+      overlay.byId.focus.frame.visible = attentionOpen;
+      overlay.byId.world.mesh.visible = settlementOpen;
+      overlay.byId.world.frame.visible = settlementOpen;
+      overlay.byId.feed.mesh.visible = settlementOpen && !compact;
+      overlay.byId.feed.frame.visible = settlementOpen && !compact;
+      overlay.byId.radial.mesh.visible = app.radialMenuOpen;
+      overlay.byId.radial.frame.visible = app.radialMenuOpen;
       overlay.byId.touch.mesh.visible = app.touchControls.enabled;
       overlay.byId.touch.frame.visible = app.touchControls.enabled;
 
@@ -5141,7 +5590,7 @@
 
     async function toggleXRSession() {
       const three = app.three;
-      if (!three) {
+      if (!three || !navigator.xr) {
         return;
       }
       const session = three.renderer.xr.getSession();
@@ -5149,32 +5598,72 @@
         await session.end();
         return;
       }
+      if (!window.isSecureContext && !["localhost", "127.0.0.1"].includes(location.hostname)) {
+        dom.xrSupport.textContent = "HTTPS required";
+        return;
+      }
+      dom.xrToggle.disabled = true;
+      dom.xrSupport.textContent = "Starting XR...";
       try {
-        const xrSession = await navigator.xr.requestSession("immersive-vr", {
-          optionalFeatures: ["local-floor", "bounded-floor", "hand-tracking", "layers"],
-        });
-        const gl = three.renderer.getContext();
-        const baseLayer = new XRWebGLLayer(xrSession, gl, {
-          framebufferScaleFactor: XRWebGLLayer.getNativeFramebufferScaleFactor(xrSession),
-          antialias: true,
-        });
-        xrSession.updateRenderState({ baseLayer });
+        const sessionOptions = [
+          { optionalFeatures: ["local-floor", "bounded-floor"] },
+          { optionalFeatures: ["local-floor"] },
+          {},
+        ];
+        let xrSession = null;
+        let lastError = null;
+        for (const options of sessionOptions) {
+          try {
+            xrSession = await navigator.xr.requestSession("immersive-vr", options);
+            break;
+          } catch (error) {
+            lastError = error;
+          }
+        }
+        if (!xrSession) {
+          throw lastError || new Error("No immersive-vr session options were accepted.");
+        }
+        three.renderer.xr.setFramebufferScaleFactor(1);
+        const referenceSpaceFallbacks = ["local-floor", "local", "viewer"];
+        let attached = false;
+        for (const referenceSpaceType of referenceSpaceFallbacks) {
+          try {
+            three.renderer.xr.setReferenceSpaceType(referenceSpaceType);
+            await three.renderer.xr.setSession(xrSession);
+            app.xrReferenceSpaceType = referenceSpaceType;
+            attached = true;
+            break;
+          } catch (attachError) {
+            lastError = attachError;
+          }
+        }
+        if (!attached) {
+          await xrSession.end().catch(() => {});
+          throw lastError || new Error("XR session opened, but no reference space could be attached.");
+        }
         xrSession.addEventListener("end", () => {
           document.body.classList.remove("xr-active");
           dom.xrToggle.textContent = "Enter XR";
+          dom.xrToggle.disabled = false;
+          dom.xrSupport.textContent = app.xrSupported ? "Desktop + XR" : "Desktop only";
           three.camera.position.set(0, 1.8, 5.8);
-          app.xrPanelsOpen = false;
+          app.radialMenuOpen = false;
         });
         document.body.classList.add("xr-active");
         dom.xrToggle.textContent = "Exit XR";
-        app.xrPanelsOpen = false;
+        dom.xrToggle.disabled = false;
+        dom.xrSupport.textContent = `XR active | ${app.xrReferenceSpaceType}`;
+        app.radialMenuOpen = false;
         three.camera.position.set(0, 0, 0);
-        await three.renderer.xr.setSession(xrSession);
         markXRPanelsDirty();
       } catch (error) {
         console.warn("XR session failed", error);
-        alert("XR session could not be started.");
+        dom.xrSupport.textContent = `XR failed: ${error?.message || "unknown error"}`;
+        dom.xrToggle.disabled = !app.xrSupported;
+        alert(`XR session could not be started. ${error?.message || ""}`.trim());
+        return;
       }
+      dom.xrToggle.disabled = false;
     }
 
     function updateXRUi(three) {
@@ -5183,14 +5672,24 @@
       }
       const { renderer, xrUi } = three;
       const isPresenting = renderer.xr.isPresenting;
-      xrUi.panelRoot.visible = isPresenting && app.xrPanelsOpen;
+      layoutXRUi(three);
+      xrUi.panelRoot.visible = isPresenting && (app.panelMode !== "none" || app.radialMenuOpen);
       if (!isPresenting) {
         return;
       }
 
-      if (app.xrPanelsOpen) {
+      xrUi.panels.find((panel) => panel.id === "world").mesh.visible = app.panelMode === "settlement";
+      xrUi.panels.find((panel) => panel.id === "world").frame.visible = app.panelMode === "settlement";
+      xrUi.panels.find((panel) => panel.id === "feed").mesh.visible = app.panelMode === "settlement";
+      xrUi.panels.find((panel) => panel.id === "feed").frame.visible = app.panelMode === "settlement";
+      xrUi.panels.find((panel) => panel.id === "focus").mesh.visible = app.panelMode === "attention";
+      xrUi.panels.find((panel) => panel.id === "focus").frame.visible = app.panelMode === "attention";
+      xrUi.panels.find((panel) => panel.id === "radial").mesh.visible = app.radialMenuOpen;
+      xrUi.panels.find((panel) => panel.id === "radial").frame.visible = app.radialMenuOpen;
+
+      if (xrUi.panelRoot.visible) {
         for (const panel of xrUi.panels) {
-          if (panel.dirty) {
+          if (panel.mesh.visible && panel.dirty) {
             drawXRPanel(panel);
           }
         }
@@ -5211,7 +5710,7 @@
         xrUi.rayMatrix.identity().extractRotation(controller.matrixWorld);
         xrUi.raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
         xrUi.raycaster.ray.direction.set(0, 0, -1).applyMatrix4(xrUi.rayMatrix);
-        if (app.xrPanelsOpen) {
+        if (app.panelMode !== "none" || app.radialMenuOpen) {
           const intersections = xrUi.raycaster.intersectObjects(xrUi.panels.map((panel) => panel.mesh), false);
           if (intersections.length) {
             const hit = intersections[0];
@@ -5270,9 +5769,92 @@
       wrapCanvasText(ctx, subtitle, hotspot.x + 20, hotspot.y + 74, hotspot.w - 32, 28, 2);
     }
 
+    function drawRadialPanel(panel) {
+      const ctx = panel.ctx;
+      const entries = getRadialEntries();
+      const centerX = panel.uiWidth * 0.5;
+      const centerY = panel.uiHeight * 0.5;
+      const outerRadius = Math.min(panel.uiWidth, panel.uiHeight) * 0.42;
+      const innerRadius = outerRadius * 0.42;
+      const angleStep = entries.length ? (Math.PI * 2) / entries.length : Math.PI * 2;
+      panel.hotspots = [];
+      panel.dirty = false;
+      beginPanelDraw(panel);
+      ctx.fillStyle = "rgba(8,12,13,0.56)";
+      ctx.fillRect(0, 0, panel.uiWidth, panel.uiHeight);
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+
+      entries.forEach((entry, index) => {
+        const startAngle = -Math.PI / 2 + index * angleStep;
+        const endAngle = startAngle + angleStep;
+        const isActive = index === app.radialSelection || panel.hoverKey === entry.id;
+        ctx.beginPath();
+        ctx.moveTo(centerX + Math.cos(startAngle) * innerRadius, centerY + Math.sin(startAngle) * innerRadius);
+        ctx.arc(centerX, centerY, outerRadius, startAngle, endAngle);
+        ctx.arc(centerX, centerY, innerRadius, endAngle, startAngle, true);
+        ctx.closePath();
+        ctx.fillStyle = entry.enabled === false
+          ? "rgba(61,64,61,0.86)"
+          : isActive
+            ? "rgba(124,91,51,0.94)"
+            : "rgba(41,64,58,0.9)";
+        ctx.fill();
+        ctx.strokeStyle = "rgba(243,220,184,0.22)";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        const mid = startAngle + angleStep * 0.5;
+        const labelRadius = innerRadius + (outerRadius - innerRadius) * 0.56;
+        const textX = centerX + Math.cos(mid) * labelRadius;
+        const textY = centerY + Math.sin(mid) * labelRadius;
+        ctx.fillStyle = entry.enabled === false ? "rgba(240,227,201,0.42)" : "#f1e3c9";
+        ctx.font = "700 24px Avenir Next Condensed, Gill Sans, sans-serif";
+        wrapCanvasText(ctx, entry.label, textX - 76, textY - 18, 152, 22, 2, true);
+        ctx.fillStyle = "rgba(241,227,201,0.68)";
+        ctx.font = "500 16px IBM Plex Mono, monospace";
+        wrapCanvasText(ctx, entry.subtitle, textX - 76, textY + 18, 152, 18, 2, true);
+        panel.hotspots.push({
+          id: entry.id,
+          kind: "radial",
+          cx: centerX,
+          cy: centerY,
+          innerRadius,
+          outerRadius,
+          startAngle,
+          endAngle,
+          enabled: entry.enabled,
+          onSelect: () => {
+            app.radialSelection = index;
+            activateRadialSelection();
+          },
+        });
+      });
+
+      ctx.beginPath();
+      ctx.arc(centerX, centerY, innerRadius - 18, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(12,18,18,0.96)";
+      ctx.fill();
+      ctx.strokeStyle = "rgba(243,220,184,0.24)";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.fillStyle = "#f1e3c9";
+      ctx.font = "700 28px IBM Plex Mono, monospace";
+      ctx.fillText(app.panelMode === "attention" ? "ATTN" : app.panelMode === "settlement" ? "WORLD" : "MENU", centerX, centerY - 12);
+      ctx.fillStyle = "rgba(241,227,201,0.7)";
+      ctx.font = "500 18px IBM Plex Mono, monospace";
+      ctx.fillText("E / Tab open", centerX, centerY + 18);
+      panel.texture.needsUpdate = true;
+    }
+
     function drawXRPanel(panel) {
       const ctx = panel.ctx;
       const state = app.state || demoState;
+      if (panel.id === "radial") {
+        drawRadialPanel(panel);
+        return;
+      }
+      const pad = 36;
+      const innerWidth = panel.uiWidth - pad * 2;
       panel.hotspots = [];
       panel.dirty = false;
       beginPanelDraw(panel);
@@ -5287,29 +5869,32 @@
       ctx.font = "500 26px Avenir Next Condensed, Gill Sans, sans-serif";
 
       if (panel.id === "world") {
-        ctx.fillText(`${state.world.location_name} | ${titleCase(state.world.weather)}`, 36, 108);
-        ctx.fillText(`day ${state.world.day} tick ${state.world.tick} | scarcity ${formatFixed(state.world.scarcity_index)} | stress ${formatFixed(state.world.field_stress)}`, 36, 140);
+        wrapCanvasText(ctx, `${state.world.location_name} | ${titleCase(state.world.weather)}`, pad, 108, innerWidth, 28, 2);
+        wrapCanvasText(ctx, `day ${state.world.day} tick ${state.world.tick} | scarcity ${formatFixed(state.world.scarcity_index)} | stress ${formatFixed(state.world.field_stress)}`, pad, 144, innerWidth, 28, 2);
         let y = 188;
         for (const event of (state.world.active_events || []).slice(0, 2)) {
           ctx.fillStyle = "rgba(241,227,201,0.92)";
-          wrapCanvasText(ctx, event.summary, 36, y, 930, 28, 3);
+          wrapCanvasText(ctx, event.summary, pad, y, innerWidth, 28, 3);
           y += 70;
         }
         const traveling = !!state.player.travel_state?.is_traveling;
         if (traveling) {
           ctx.fillStyle = "rgba(241,227,201,0.92)";
           ctx.font = "500 28px Avenir Next Condensed, Gill Sans, sans-serif";
-          ctx.fillText(`The road is a lock. It opens only when the travel clock for ${travelDestinationName(state)} hits zero.`, 36, 250);
-          ctx.fillText(`risk ${formatFixed(state.player.travel_state.risk_budget)} | food ${foodUnitsAvailable(state)} | ${state.player.travel_state.ticks_remaining} ticks until release`, 36, 282);
+          wrapCanvasText(ctx, `The road is a lock. It opens only when the travel clock for ${travelDestinationName(state)} hits zero.`, pad, 250, innerWidth, 30, 2);
+          wrapCanvasText(ctx, `risk ${formatFixed(state.player.travel_state.risk_budget)} | food ${foodUnitsAvailable(state)} | ${state.player.travel_state.ticks_remaining} ticks until release`, pad, 314, innerWidth, 28, 2);
           const enabled = (state.actions.common || []).filter((action) => actionEnabled(action, state) && ["look", "meal", "next 1"].includes(action.command));
           const blocked = (state.actions.common || []).filter((action) => !actionEnabled(action, state) && ["rest 1", "sleep 3", "work"].includes(action.command));
+          const buttonGap = 16;
+          const buttonWidth = Math.floor((innerWidth - buttonGap) / 2);
+          const buttonHeight = 88;
           enabled.forEach((action, index) => {
             const hotspot = {
               id: `world-road-${index}`,
-              x: 36,
-              y: 336 + index * 108,
-              w: 452,
-              h: 92,
+              x: pad,
+              y: 368 + index * (buttonHeight + buttonGap),
+              w: buttonWidth,
+              h: buttonHeight,
               enabled: actionEnabled(action, state),
               onSelect: () => sendCommand(action.command),
             };
@@ -5319,10 +5904,10 @@
           blocked.forEach((action, index) => {
             const hotspot = {
               id: `world-road-blocked-${index}`,
-              x: 540,
-              y: 336 + index * 108,
-              w: 448,
-              h: 92,
+              x: pad + buttonWidth + buttonGap,
+              y: 368 + index * (buttonHeight + buttonGap),
+              w: buttonWidth,
+              h: buttonHeight,
               enabled: false,
               onSelect: () => {},
             };
@@ -5332,14 +5917,19 @@
         } else {
           const common = (state.actions.common || []).slice(0, 4);
           const travel = (state.actions.travel || []).slice(0, 3);
-          let buttonY = 292;
+          const buttonY = 292;
+          const buttonGap = 16;
+          const buttonWidth = Math.floor((innerWidth - buttonGap) / 2);
+          const buttonHeight = 88;
           common.forEach((action, index) => {
+            const column = index % 2;
+            const row = Math.floor(index / 2);
             const hotspot = {
               id: `world-common-${index}`,
-              x: 36,
-              y: buttonY + index * 108,
-              w: 440,
-              h: 92,
+              x: pad + column * (buttonWidth + buttonGap),
+              y: buttonY + row * (buttonHeight + buttonGap),
+              w: buttonWidth,
+              h: buttonHeight,
               enabled: actionEnabled(action, state),
               onSelect: () => sendCommand(action.command),
             };
@@ -5347,12 +5937,14 @@
             drawPanelButton(ctx, panel, hotspot, action.label, actionBlockedReason(action, state) || action.command);
           });
           travel.forEach((action, index) => {
+            const column = index % 2;
+            const row = Math.floor(index / 2);
             const hotspot = {
               id: `world-travel-${index}`,
-              x: 540,
-              y: buttonY + index * 108,
-              w: 448,
-              h: 92,
+              x: pad + column * (buttonWidth + buttonGap),
+              y: buttonY + 2 * (buttonHeight + buttonGap) + row * (buttonHeight + buttonGap),
+              w: buttonWidth,
+              h: buttonHeight,
               enabled: actionEnabled(action, state),
               onSelect: () => sendCommand(action.command),
             };
@@ -5367,39 +5959,50 @@
         let y = 110;
         feed.forEach((event) => {
           ctx.fillStyle = event.kind === "npc" ? "#a8d0b0" : event.kind === "input" ? "#e1c08f" : "#f1e3c9";
-          ctx.font = "700 26px IBM Plex Mono, monospace";
-          ctx.fillText(`${shortKind(event.kind)}  day ${event.day} tick ${event.tick}`, 36, y);
+          ctx.font = "700 21px IBM Plex Mono, monospace";
+          wrapCanvasText(ctx, `${shortKind(event.kind)}  day ${event.day} tick ${event.tick}`, pad, y, innerWidth, 24, 2);
           ctx.fillStyle = "rgba(241,227,201,0.82)";
-          ctx.font = "500 26px Avenir Next Condensed, Gill Sans, sans-serif";
-          wrapCanvasText(ctx, event.text, 36, y + 32, 944, 30, 3);
-          y += 104;
+          ctx.font = "500 21px Avenir Next Condensed, Gill Sans, sans-serif";
+          wrapCanvasText(ctx, event.text, pad, y + 28, innerWidth, 24, 3);
+          y += 86;
         });
       }
 
       if (panel.id === "focus") {
         const target = currentTargetPerson();
+        const cardGap = 16;
+        const cardWidth = Math.floor((innerWidth - cardGap) / 2);
+        const personButtonY = 352;
+        const personButtonHeight = 86;
+        const actionGap = 16;
+        const actionWidth = Math.floor((innerWidth - actionGap * 2) / 3);
+        const actionY = 574;
+        const tradeGap = 16;
+        const tradeWidth = Math.floor((innerWidth - tradeGap) / 2);
+        const tradeY = 676;
         ctx.fillStyle = "rgba(241,227,201,0.92)";
         ctx.font = "500 30px Avenir Next Condensed, Gill Sans, sans-serif";
         if (state.player.travel_state?.is_traveling) {
-          ctx.fillText("Travel strips away local assumptions until arrival.", 36, 108);
-          ctx.fillText(`destination ${travelDestinationName(state)} | ${state.player.travel_state.ticks_remaining} ticks until release`, 36, 142);
-          ctx.fillText(`Repeat turn-spending actions to escape this state. Looking does not move the clock.`, 36, 176);
+          wrapCanvasText(ctx, "Travel strips away local assumptions until arrival.", pad, 108, innerWidth, 32, 2);
+          wrapCanvasText(ctx, `destination ${travelDestinationName(state)} | ${state.player.travel_state.ticks_remaining} ticks until release`, pad, 148, innerWidth, 30, 2);
+          wrapCanvasText(ctx, "Repeat turn-spending actions to escape this state. Looking does not move the clock.", pad, 188, innerWidth, 30, 3);
         } else if (target) {
-          ctx.fillText(`${target.name} | ${titleCase(target.profession)} | ${target.mood}`, 36, 108);
-          wrapCanvasText(ctx, state.target?.detail_text || "", 36, 146, 952, 26, 6);
+          wrapCanvasText(ctx, `${target.name} | ${titleCase(target.profession)} | ${target.mood}`, pad, 108, innerWidth, 32, 2);
+          wrapCanvasText(ctx, state.target?.detail_text || "", pad, 154, innerWidth, 26, 6);
         } else {
-          ctx.fillText("No single person is in close attention.", 36, 108);
-          ctx.fillText(`${state.scene.people.length} nearby figures remain in public space.`, 36, 142);
+          wrapCanvasText(ctx, "No single person is in close attention.", pad, 108, innerWidth, 32, 2);
+          wrapCanvasText(ctx, `${state.scene.people.length} nearby figures remain in public space.`, pad, 148, innerWidth, 30, 2);
         }
 
-        let y = 352;
         (state.scene.people || []).slice(0, 4).forEach((person, index) => {
+          const column = index % 2;
+          const row = Math.floor(index / 2);
           const hotspot = {
             id: `focus-person-${index}`,
-            x: 36 + (index % 2) * 476,
-            y: y + Math.floor(index / 2) * 102,
-            w: 452,
-            h: 86,
+            x: pad + column * (cardWidth + cardGap),
+            y: personButtonY + row * 102,
+            w: cardWidth,
+            h: personButtonHeight,
             enabled: true,
             onSelect: () => sendCommand(person.is_target ? "focus clear" : `focus ${person.npc_id}`),
           };
@@ -5411,9 +6014,9 @@
         targetActions.forEach((action, index) => {
           const hotspot = {
             id: `focus-action-${index}`,
-            x: 36 + index * 316,
-            y: 574,
-            w: 292,
+            x: pad + index * (actionWidth + actionGap),
+            y: actionY,
+            w: actionWidth,
             h: 84,
             enabled: actionEnabled(action, state),
             onSelect: () => sendCommand(action.command),
@@ -5427,9 +6030,9 @@
         options.forEach((option, index) => {
           const hotspot = {
             id: `focus-trade-${index}`,
-            x: 692,
-            y: 574 - index * 98,
-            w: 296,
+            x: pad + index * (tradeWidth + tradeGap),
+            y: tradeY,
+            w: tradeWidth,
             h: 84,
             enabled: !!target,
             onSelect: () => runTrade(option.item, 1),
@@ -5509,6 +6112,8 @@
 
     function drawNotePanel(panel) {
       const ctx = panel.ctx;
+      const playerSpeech = lastPlayerSpeech();
+      const noteText = playerSpeech ? `You: "${playerSpeech}"` : (dom.reticleNote.textContent || "");
       panel.hotspots = [];
       panel.dirty = false;
       beginPanelDraw(panel);
@@ -5518,7 +6123,7 @@
       ctx.strokeRect(0.5, 0.5, panel.uiWidth - 1, panel.uiHeight - 1);
       ctx.fillStyle = "#f3e5cb";
       ctx.font = "600 28px IBM Plex Mono, monospace";
-      wrapCanvasText(ctx, dom.reticleNote.textContent || "", 28, 52, panel.uiWidth - 56, 32, 3);
+      wrapCanvasText(ctx, noteText, 28, 52, panel.uiWidth - 56, 32, 3);
       panel.texture.needsUpdate = true;
     }
 
@@ -5623,14 +6228,18 @@
       ctx.closePath();
     }
 
-    function wrapCanvasText(ctx, text, x, y, maxWidth, lineHeight, maxLines) {
+    function wrapCanvasText(ctx, text, x, y, maxWidth, lineHeight, maxLines, center = false) {
       const words = String(text || "").split(/\s+/);
       let line = "";
       let lines = 0;
+      const drawLine = (value, lineIndex) => {
+        const drawX = center ? x + maxWidth * 0.5 : x;
+        ctx.fillText(value, drawX, y + lineIndex * lineHeight);
+      };
       for (const word of words) {
         const test = line ? `${line} ${word}` : word;
         if (ctx.measureText(test).width > maxWidth && line) {
-          ctx.fillText(line, x, y + lines * lineHeight);
+          drawLine(line, lines);
           line = word;
           lines += 1;
           if (lines >= maxLines) {
@@ -5641,7 +6250,7 @@
         }
       }
       if (line && lines < maxLines) {
-        ctx.fillText(line, x, y + lines * lineHeight);
+        drawLine(line, lines);
       }
     }
 

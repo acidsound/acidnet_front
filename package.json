@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "AcidNet frontend shell and scene contract tests",
   "scripts": {
+    "dev:proxy": "node scripts/dev-proxy.mjs",
     "test": "playwright test",
     "test:scene": "playwright test",
     "test:scene:headed": "playwright test --headed",
